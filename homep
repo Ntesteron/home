@@ -1,0 +1,841 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
+import { PieChart, Pie, Cell, Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend, ResponsiveContainer } from 'recharts';
+
+// Ensure Firebase config and app ID are available from the environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Utility to get today's date in YYYY-MM-DD format
+const getTodayDate = () => {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = (today.getMonth() + 1).toString().padStart(2, '0');
+    const day = today.getDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
+// Define categories and subcategories
+const incomeSubcategories = ['Зарплата', 'Кэшбэк', 'Иные выплаты'];
+const expenseCategories = [
+    'Коммунальные платежи', 'Хоз товары', 'Продукты', 'Развлечения', 'Хобби',
+    'Домашние животные', 'Одежда', 'Транспорт', 'Бытовые принадлежности',
+    'Связь и подписки', 'Ремонт'
+];
+const COLORS = [
+    '#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d',
+    '#a4de6c', '#d0ed57', '#ffc658', '#f17373', '#9c73f1'
+]; // Colors for charts
+
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [transactions, setTransactions] = useState([]);
+    const [savings, setSavings] = useState([]);
+    const [budgets, setBudgets] = useState({}); // New state for expense budgets
+    const [currentMonth, setCurrentMonth] = useState(new Date(getTodayDate())); // State for month navigation
+    const [message, setMessage] = useState(''); // For user messages
+
+    // Form states for adding transactions
+    const [transactionForm, setTransactionForm] = useState({
+        date: getTodayDate(),
+        type: 'expense',
+        category: expenseCategories[0], // For expense: actual category, for income: main 'Доход' category
+        subcategory: incomeSubcategories[0], // Only for income: specific subcategory
+        amount: '',
+        description: ''
+    });
+
+    // Form states for adding savings
+    const [savingForm, setSavingForm] = useState({
+        date: getTodayDate(),
+        amount: '',
+        interestRate: '' // Annual percentage, e.g., 5 for 5%
+    });
+
+    // Initialize Firebase and set up authentication
+    useEffect(() => {
+        const app = initializeApp(firebaseConfig);
+        const authInstance = getAuth(app);
+        const dbInstance = getFirestore(app);
+
+        setAuth(authInstance);
+        setDb(dbInstance);
+
+        const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+                console.log('Firebase user authenticated:', user.uid);
+            } else {
+                try {
+                    // Sign in anonymously if no initial token or user is not authenticated
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(authInstance, initialAuthToken);
+                        console.log('Signed in with custom token.');
+                    } else {
+                        const anonUser = await signInAnonymously(authInstance);
+                        setUserId(anonUser.user.uid);
+                        console.log('Signed in anonymously:', anonUser.user.uid);
+                    }
+                } catch (error) {
+                    console.error('Firebase authentication failed:', error);
+                    setMessage(`Ошибка аутентификации: ${error.message}`);
+                }
+            }
+            setLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, []);
+
+    // Fetch data from Firestore once authenticated
+    useEffect(() => {
+        if (db && userId) {
+            console.log('Fetching data for user:', userId);
+            const userTransactionsPath = `artifacts/${appId}/users/${userId}/transactions`;
+            const userSavingsPath = `artifacts/${appId}/users/${userId}/savings`;
+            const userBudgetsPath = `artifacts/${appId}/users/${userId}/budgets/category_budgets`; // Path for budgets document
+
+            // Setup real-time listener for transactions
+            const transactionsRef = collection(db, userTransactionsPath);
+            const unsubscribeTransactions = onSnapshot(transactionsRef, (snapshot) => {
+                const fetchedTransactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setTransactions(fetchedTransactions);
+                console.log('Transactions fetched:', fetchedTransactions.length);
+            }, (error) => {
+                console.error("Error fetching transactions:", error);
+                setMessage(`Ошибка загрузки транзакций: ${error.message}`);
+            });
+
+            // Setup real-time listener for savings
+            const savingsRef = collection(db, userSavingsPath);
+            const unsubscribeSavings = onSnapshot(savingsRef, (snapshot) => {
+                const fetchedSavings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setSavings(fetchedSavings);
+                console.log('Savings fetched:', fetchedSavings.length);
+            }, (error) => {
+                console.error("Error fetching savings:", error);
+                setMessage(`Ошибка загрузки накоплений: ${error.message}`);
+            });
+
+            // Setup real-time listener for budgets
+            const budgetDocRef = doc(db, userBudgetsPath);
+            const unsubscribeBudgets = onSnapshot(budgetDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    setBudgets(docSnap.data().data || {}); // Assuming budgets are stored under a 'data' field
+                } else {
+                    setBudgets({}); // No budget document yet
+                }
+                console.log('Budgets fetched:', docSnap.exists() ? docSnap.data().data : 'None');
+            }, (error) => {
+                console.error("Error fetching budgets:", error);
+                setMessage(`Ошибка загрузки бюджетов: ${error.message}`);
+            });
+
+            // Cleanup listeners on unmount or userId change
+            return () => {
+                unsubscribeTransactions();
+                unsubscribeSavings();
+                unsubscribeBudgets();
+            };
+        }
+    }, [db, userId]);
+
+    // Handle form input changes for transactions
+    const handleTransactionChange = (e) => {
+        const { name, value } = e.target;
+        setTransactionForm(prev => {
+            const newState = { ...prev, [name]: value };
+            // Adjust category/subcategory defaults when type changes
+            if (name === 'type') {
+                if (value === 'expense') {
+                    newState.category = expenseCategories[0];
+                    newState.subcategory = ''; // No subcategory for expenses
+                } else { // type is 'income'
+                    newState.category = ''; // Main category will be fixed 'Доход' in addTransaction
+                    newState.subcategory = incomeSubcategories[0];
+                }
+            }
+            return newState;
+        });
+    };
+
+    // Handle form input changes for savings
+    const handleSavingChange = (e) => {
+        const { name, value } = e.target;
+        setSavingForm(prev => ({ ...prev, [name]: value }));
+    };
+
+    // Add a new transaction
+    const addTransaction = async () => {
+        if (!db || !userId) {
+            setMessage('Ошибка: Пользователь не аутентифицирован или база данных не инициализирована.');
+            return;
+        }
+
+        const { date, type, category, subcategory, amount, description } = transactionForm;
+        
+        let newTransaction = {
+            date: date,
+            type: type,
+            amount: parseFloat(amount),
+            description: description
+        };
+
+        if (type === 'expense') {
+            if (!date || !category || !amount || isNaN(parseFloat(amount))) {
+                setMessage('Пожалуйста, заполните все обязательные поля для расхода (дата, категория, сумма).');
+                return;
+            }
+            newTransaction.category = category;
+            newTransaction.subcategory = ''; // Explicitly empty for expenses
+        } else { // type is 'income'
+            if (!date || !subcategory || !amount || isNaN(parseFloat(amount))) {
+                setMessage('Пожалуйста, заполните все обязательные поля для дохода (дата, подкатегория, сумма).');
+                return;
+            }
+            newTransaction.category = 'Доход'; // Fixed main category for income
+            newTransaction.subcategory = subcategory;
+        }
+
+        try {
+            const docRef = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/transactions`), newTransaction);
+            setMessage(`Транзакция добавлена успешно! ID: ${docRef.id}`);
+            // Reset form
+            setTransactionForm({
+                date: getTodayDate(),
+                type: 'expense',
+                category: expenseCategories[0],
+                subcategory: incomeSubcategories[0], // Keep default for next income selection
+                amount: '',
+                description: ''
+            });
+        } catch (e) {
+            console.error("Error adding document: ", e);
+            setMessage(`Ошибка добавления транзакции: ${e.message}`);
+        }
+    };
+
+    // Add a new savings entry
+    const addSaving = async () => {
+        if (!db || !userId) {
+            setMessage('Ошибка: Пользователь не аутентифицирован или база данных не инициализирована.');
+            return;
+        }
+
+        const { date, amount, interestRate } = savingForm;
+        if (!date || !amount || isNaN(parseFloat(amount)) || !interestRate || isNaN(parseFloat(interestRate))) {
+            setMessage('Пожалуйста, заполните все обязательные поля для накоплений (дата, сумма, процент).');
+            return;
+        }
+
+        const newSaving = {
+            date: date,
+            amount: parseFloat(amount),
+            interestRate: parseFloat(interestRate) / 100 // Convert percentage to decimal
+        };
+
+        try {
+            const docRef = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/savings`), newSaving);
+            setMessage(`Накопление добавлено успешно! ID: ${docRef.id}`);
+            // Reset form
+            setSavingForm({
+                date: getTodayDate(),
+                amount: '',
+                interestRate: ''
+            });
+        } catch (e) {
+            console.error("Error adding saving: ", e);
+            setMessage(`Ошибка добавления накопления: ${e.message}`);
+        }
+    };
+
+    // Function to update a single budget category in Firestore
+    const updateBudget = async (category, amount) => {
+        if (!db || !userId) {
+            setMessage('Ошибка: Пользователь не аутентифицирован или база данных не инициализирована.');
+            return;
+        }
+        const budgetDocRef = doc(db, `artifacts/${appId}/users/${userId}/budgets/category_budgets`);
+        // Ensure amount is a number or 0 if empty string
+        const parsedAmount = parseFloat(amount) || 0;
+        const newBudget = { ...budgets, [category]: parsedAmount };
+        try {
+            // Store budgets in a 'data' field to avoid overwriting the whole document if other fields are added later
+            await setDoc(budgetDocRef, { data: newBudget }, { merge: true });
+            // setMessage(`Бюджет для ${category} обновлен.`); // Can be too chatty
+        } catch (e) {
+            console.error("Error updating budget: ", e);
+            setMessage(`Ошибка обновления бюджета: ${e.message}`);
+        }
+    };
+
+    // Handle budget input change
+    const handleBudgetChange = (category, value) => {
+        // Update local state immediately for responsiveness
+        setBudgets(prev => ({ ...prev, [category]: value }));
+        // Save to Firestore after a small delay to avoid too many writes if user types fast
+        // (For this example, saving immediately for simplicity, but debounce is recommended in production)
+        updateBudget(category, value);
+    };
+
+    // Filter transactions for the current month displayed
+    const filteredTransactions = useMemo(() => {
+        const currentMonthString = `${currentMonth.getFullYear()}-${(currentMonth.getMonth() + 1).toString().padStart(2, '0')}`;
+        return transactions.filter(t => t.date && t.date.startsWith(currentMonthString));
+    }, [transactions, currentMonth]);
+
+    // Calculate monthly income summary (by subcategory)
+    const incomeSummary = useMemo(() => {
+        return filteredTransactions
+            .filter(t => t.type === 'income')
+            .reduce((acc, t) => {
+                // Use subcategory for income summary, as requested
+                const subcategory = t.subcategory || 'Прочее';
+                acc[subcategory] = (acc[subcategory] || 0) + t.amount;
+                return acc;
+            }, {});
+    }, [filteredTransactions]);
+
+    // Calculate monthly expense summary (by category)
+    const expenseSummary = useMemo(() => {
+        return filteredTransactions
+            .filter(t => t.type === 'expense')
+            .reduce((acc, t) => {
+                acc[t.category] = (acc[t.category] || 0) + t.amount;
+                return acc;
+            }, {});
+    }, [filteredTransactions]);
+
+    // Calculate total income, expenses, and balance for the month
+    const totalIncome = useMemo(() => {
+        return Object.values(incomeSummary).reduce((sum, amount) => sum + amount, 0);
+    }, [incomeSummary]);
+
+    const totalExpenses = useMemo(() => {
+        return Object.values(expenseSummary).reduce((sum, amount) => sum + amount, 0);
+    }, [expenseSummary]);
+
+    const remainingBalance = totalIncome - totalExpenses;
+
+    // Calculate total savings amount and estimated monthly interest
+    const totalSavingsAmount = useMemo(() => {
+        return savings.reduce((sum, s) => sum + s.amount, 0);
+    }, [savings]);
+
+    const monthlySavingsInterest = useMemo(() => {
+        // This is a simplified calculation: it takes the current total savings and applies an average annual interest rate.
+        // For precise "total profitability each 1st of the month" as per prompt, a more complex historical tracking is needed.
+        if (savings.length === 0) return 0;
+        const totalInterestRate = savings.reduce((sum, s) => sum + s.interestRate * s.amount, 0);
+        const weightedAverageRate = totalInterestRate / totalSavingsAmount;
+        return (totalSavingsAmount * weightedAverageRate) / 12; // Monthly interest
+    }, [savings, totalSavingsAmount]);
+
+
+    // Prepare data for expense pie chart
+    const pieChartData = useMemo(() => {
+        return Object.entries(expenseSummary).map(([name, value]) => ({ name, value }));
+    }, [expenseSummary]);
+
+    // Prepare data for income/expense bar chart
+    const barChartData = useMemo(() => {
+        return [{
+            name: 'Месяц',
+            Доходы: totalIncome,
+            Расходы: totalExpenses
+        }];
+    }, [totalIncome, totalExpenses]);
+
+    // Month navigation handlers
+    const goToPreviousMonth = useCallback(() => {
+        setCurrentMonth(prev => {
+            const newDate = new Date(prev.getFullYear(), prev.getMonth() - 1, 1);
+            return newDate;
+        });
+    }, []);
+
+    const goToNextMonth = useCallback(() => {
+        setCurrentMonth(prev => {
+            const newDate = new Date(prev.getFullYear(), prev.getMonth() + 1, 1);
+            return newDate;
+        });
+    }, []);
+
+    // Format current month for display
+    const currentMonthDisplayName = useMemo(() => {
+        return currentMonth.toLocaleString('ru-RU', { month: 'long', year: 'numeric' });
+    }, [currentMonth]);
+
+    if (loading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
+                <div className="text-xl font-semibold text-gray-700">Загрузка данных...</div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-100 p-4 font-sans text-gray-800">
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+            <style>
+                {`
+                body {
+                    font-family: 'Inter', sans-serif;
+                }
+                .recharts-default-tooltip {
+                    background-color: #fff !important;
+                    border: 1px solid #ccc !important;
+                    padding: 8px !important;
+                    border-radius: 8px !important;
+                }
+                .recharts-tooltip-label {
+                    font-weight: bold !important;
+                    margin-bottom: 4px !important;
+                }
+                .recharts-tooltip-item-list {
+                    padding: 0 !important;
+                }
+                .recharts-tooltip-item {
+                    list-style: none !important;
+                }
+                `}
+            </style>
+
+            <div className="max-w-6xl mx-auto bg-white rounded-xl shadow-lg p-6 md:p-8">
+                <h1 className="text-3xl md:text-4xl font-bold text-center text-blue-700 mb-8">Домашняя Бухгалтерия</h1>
+
+                {userId && (
+                    <div className="text-sm text-gray-500 text-center mb-4">
+                        Ваш ID пользователя: <span className="font-mono bg-gray-200 px-2 py-1 rounded">{userId}</span>
+                    </div>
+                )}
+
+                {message && (
+                    <div className="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative mb-6" role="alert">
+                        <span className="block sm:inline">{message}</span>
+                        <span className="absolute top-0 bottom-0 right-0 px-4 py-3" onClick={() => setMessage('')}>
+                            <svg className="fill-current h-6 w-6 text-blue-500" role="button" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><title>Закрыть</title><path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.697l-2.651 2.652a1.2 1.2 0 1 1-1.697-1.697L8.303 10 5.651 7.348a1.2 1.2 0 1 1 1.697-1.697L10 8.303l2.651-2.652a1.2 1.2 0 0 1 1.697 1.697L11.697 10l2.651 2.651a1.2 1.2 0 0 1 0 1.698z"/></svg>
+                        </span>
+                    </div>
+                )}
+
+                {/* Month Navigation */}
+                <div className="flex justify-center items-center mb-8 bg-gray-50 p-3 rounded-lg shadow-sm">
+                    <button
+                        onClick={goToPreviousMonth}
+                        className="p-2 rounded-full bg-blue-500 text-white hover:bg-blue-600 transition duration-200 shadow-md mr-4"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                        </svg>
+                    </button>
+                    <h2 className="text-2xl font-semibold text-gray-700">{currentMonthDisplayName}</h2>
+                    <button
+                        onClick={goToNextMonth}
+                        className="p-2 rounded-full bg-blue-500 text-white hover:bg-blue-600 transition duration-200 shadow-md ml-4"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        </svg>
+                    </button>
+                </div>
+
+                {/* Dashboard Summary */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div className="bg-green-100 p-6 rounded-lg shadow-md border-l-4 border-green-500">
+                        <h3 className="text-xl font-semibold text-green-700 mb-2">Доходы за месяц</h3>
+                        <p className="text-3xl font-bold text-green-900">{totalIncome.toLocaleString('ru-RU')} ₽</p>
+                    </div>
+                    <div className="bg-red-100 p-6 rounded-lg shadow-md border-l-4 border-red-500">
+                        <h3 className="text-xl font-semibold text-red-700 mb-2">Расходы за месяц</h3>
+                        <p className="text-3xl font-bold text-red-900">{totalExpenses.toLocaleString('ru-RU')} ₽</p>
+                    </div>
+                    <div className="bg-blue-100 p-6 rounded-lg shadow-md border-l-4 border-blue-500">
+                        <h3 className="text-xl font-semibold text-blue-700 mb-2">Остаток за месяц</h3>
+                        <p className={`text-3xl font-bold ${remainingBalance >= 0 ? 'text-blue-900' : 'text-red-900'}`}>
+                            {remainingBalance.toLocaleString('ru-RU')} ₽
+                        </p>
+                    </div>
+                </div>
+
+                {/* Total Savings Section */}
+                <div className="bg-purple-100 p-6 rounded-lg shadow-md border-l-4 border-purple-500 mb-8">
+                    <h3 className="text-xl font-semibold text-purple-700 mb-2">Всего накоплений</h3>
+                    <p className="text-3xl font-bold text-purple-900">{totalSavingsAmount.toLocaleString('ru-RU')} ₽</p>
+                    <p className="text-lg text-purple-800 mt-2">
+                        Примерный доход по накоплениям в этом месяце (по 1 числу):{' '}
+                        <span className="font-semibold">{monthlySavingsInterest.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽</span>
+                    </p>
+                </div>
+
+                {/* Expense Budgeting Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-6 text-center">Планирование Расходов и Текущие Траты</h2>
+                    <div className="bg-gray-50 p-6 rounded-lg shadow-md overflow-x-auto">
+                        {expenseCategories.length > 0 ? (
+                            <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-sm">
+                                <thead className="bg-blue-200">
+                                    <tr>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-blue-800 uppercase tracking-wider">Категория</th>
+                                        <th className="py-3 px-4 text-right text-sm font-medium text-blue-800 uppercase tracking-wider">Текущие Траты (₽)</th>
+                                        <th className="py-3 px-4 text-right text-sm font-medium text-blue-800 uppercase tracking-wider">Планируемая Сумма (₽)</th>
+                                        <th className="py-3 px-4 text-center text-sm font-medium text-blue-800 uppercase tracking-wider">Статус</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200">
+                                    {expenseCategories.map(cat => {
+                                        const currentSpend = expenseSummary[cat] || 0;
+                                        const plannedBudget = budgets[cat] ? parseFloat(budgets[cat]) : 0; // Use parseFloat and default to 0
+                                        const exceeded = plannedBudget > 0 && currentSpend > plannedBudget;
+                                        const nearingLimit = plannedBudget > 0 && currentSpend >= plannedBudget * 0.70 && !exceeded;
+
+                                        return (
+                                            <tr key={cat}>
+                                                <td className="py-3 px-4 whitespace-nowrap">{cat}</td>
+                                                <td className="py-3 px-4 text-right whitespace-nowrap">{currentSpend.toLocaleString('ru-RU')}</td>
+                                                <td className="py-3 px-4 text-right whitespace-nowrap">
+                                                    <input
+                                                        type="number"
+                                                        value={budgets[cat] || ''} // Display empty string for 0 or undefined
+                                                        onChange={(e) => handleBudgetChange(cat, e.target.value)}
+                                                        className="p-2 border border-gray-300 rounded-md w-28 text-right focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        placeholder="0"
+                                                    />
+                                                </td>
+                                                <td className="py-3 px-4 text-center whitespace-nowrap">
+                                                    {exceeded && (
+                                                        <span className="text-red-600 font-semibold text-xs">
+                                                            Вы превысили траты по данной категории!
+                                                        </span>
+                                                    )}
+                                                    {nearingLimit && (
+                                                        <span className="text-orange-500 font-semibold text-xs">
+                                                            Вы скоро исчерпаете лимит трат
+                                                        </span>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        ) : (
+                            <p className="text-gray-600">Нет заданных категорий расходов.</p>
+                        )}
+                    </div>
+                </div>
+
+                {/* Add Transaction and Savings Forms */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    {/* Add Transaction Form */}
+                    <div className="bg-gray-50 p-6 rounded-lg shadow-md">
+                        <h2 className="text-2xl font-semibold text-gray-700 mb-4">Добавить Транзакцию</h2>
+                        <div className="grid grid-cols-1 gap-4">
+                            <input
+                                type="date"
+                                name="date"
+                                value={transactionForm.date}
+                                onChange={handleTransactionChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <select
+                                name="type"
+                                value={transactionForm.type}
+                                onChange={handleTransactionChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            >
+                                <option value="expense">Расход</option>
+                                <option value="income">Доход</option>
+                            </select>
+
+                            {transactionForm.type === 'expense' ? (
+                                <>
+                                    <label htmlFor="expenseCategory" className="sr-only">Категория Расхода</label>
+                                    <select
+                                        id="expenseCategory"
+                                        name="category"
+                                        value={transactionForm.category}
+                                        onChange={handleTransactionChange}
+                                        className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    >
+                                        {expenseCategories.map(cat => (
+                                            <option key={cat} value={cat}>{cat}</option>
+                                        ))}
+                                    </select>
+                                </>
+                            ) : (
+                                <>
+                                    <label htmlFor="incomeSubcategory" className="block text-sm font-medium text-gray-700">Подкатегория Дохода</label>
+                                    <select
+                                        id="incomeSubcategory"
+                                        name="subcategory"
+                                        value={transactionForm.subcategory}
+                                        onChange={handleTransactionChange}
+                                        className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    >
+                                        {incomeSubcategories.map(sub => (
+                                            <option key={sub} value={sub}>{sub}</option>
+                                        ))}
+                                    </select>
+                                </>
+                            )}
+                            <input
+                                type="number"
+                                name="amount"
+                                placeholder="Сумма (₽)"
+                                value={transactionForm.amount}
+                                onChange={handleTransactionChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <input
+                                type="text"
+                                name="description"
+                                placeholder="Описание (необязательно)"
+                                value={transactionForm.description}
+                                onChange={handleTransactionChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button
+                                onClick={addTransaction}
+                                className="w-full bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 transition duration-200 font-semibold shadow-md"
+                            >
+                                Добавить Транзакцию
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Add Savings Form */}
+                    <div className="bg-gray-50 p-6 rounded-lg shadow-md">
+                        <h2 className="text-2xl font-semibold text-gray-700 mb-4">Добавить Накопление</h2>
+                        <div className="grid grid-cols-1 gap-4">
+                            <input
+                                type="date"
+                                name="date"
+                                value={savingForm.date}
+                                onChange={handleSavingChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <input
+                                type="number"
+                                name="amount"
+                                placeholder="Сумма пополнения (₽)"
+                                value={savingForm.amount}
+                                onChange={handleSavingChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <input
+                                type="number"
+                                name="interestRate"
+                                placeholder="Годовой % вклада (например, 5 для 5%)"
+                                value={savingForm.interestRate}
+                                onChange={handleSavingChange}
+                                className="p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button
+                                onClick={addSaving}
+                                className="w-full bg-purple-600 text-white py-3 rounded-lg hover:bg-purple-700 transition duration-200 font-semibold shadow-md"
+                            >
+                                Добавить Накопление
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Reports Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-6 text-center">Сводные Отчеты</h2>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        {/* Income Summary Table */}
+                        <div className="bg-gray-50 p-6 rounded-lg shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-4">Доходы по категориям</h3>
+                            {Object.keys(incomeSummary).length > 0 ? (
+                                <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-sm">
+                                    <thead className="bg-green-200">
+                                        <tr>
+                                            <th className="py-3 px-4 text-left text-sm font-medium text-green-800 uppercase tracking-wider">Категория</th>
+                                            <th className="py-3 px-4 text-right text-sm font-medium text-green-800 uppercase tracking-wider">Сумма (₽)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-200">
+                                        {Object.entries(incomeSummary).map(([cat, sum]) => (
+                                            <tr key={cat}>
+                                                <td className="py-3 px-4 whitespace-nowrap">{cat}</td>
+                                                <td className="py-3 px-4 text-right whitespace-nowrap">{sum.toLocaleString('ru-RU')}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            ) : (
+                                <p className="text-gray-600">Нет данных о доходах за этот месяц.</p>
+                            )}
+                        </div>
+
+                        {/* Expense Summary Table */}
+                        <div className="bg-gray-50 p-6 rounded-lg shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-4">Расходы по категориям</h3>
+                            {Object.keys(expenseSummary).length > 0 ? (
+                                <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-sm">
+                                    <thead className="bg-red-200">
+                                        <tr>
+                                            <th className="py-3 px-4 text-left text-sm font-medium text-red-800 uppercase tracking-wider">Категория</th>
+                                            <th className="py-3 px-4 text-right text-sm font-medium text-red-800 uppercase tracking-wider">Сумма (₽)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-200">
+                                        {Object.entries(expenseSummary).map(([cat, sum]) => (
+                                            <tr key={cat}>
+                                                <td className="py-3 px-4 whitespace-nowrap">{cat}</td>
+                                                <td className="py-3 px-4 text-right whitespace-nowrap">{sum.toLocaleString('ru-RU')}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            ) : (
+                                <p className="text-gray-600">Нет данных о расходах за этот месяц.</p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Charts Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-6 text-center">Визуализация Данных</h2>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        {/* Expense Distribution Pie Chart */}
+                        <div className="bg-gray-50 p-6 rounded-lg shadow-md flex flex-col items-center">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-4">Распределение Расходов</h3>
+                            {pieChartData.length > 0 ? (
+                                <ResponsiveContainer width="100%" height={300}>
+                                    <PieChart>
+                                        <Pie
+                                            data={pieChartData}
+                                            cx="50%"
+                                            cy="50%"
+                                            labelLine={false}
+                                            outerRadius={100}
+                                            fill="#8884d8"
+                                            dataKey="value"
+                                            label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                                        >
+                                            {pieChartData.map((entry, index) => (
+                                                <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                            ))}
+                                        </Pie>
+                                        <Tooltip formatter={(value) => `${value.toLocaleString('ru-RU')} ₽`} />
+                                        <Legend />
+                                    </PieChart>
+                                </ResponsiveContainer>
+                            ) : (
+                                <p className="text-gray-600">Нет данных для построения диаграммы расходов.</p>
+                            )}
+                        </div>
+
+                        {/* Income/Expense Bar Chart */}
+                        <div className="bg-gray-50 p-6 rounded-lg shadow-md flex flex-col items-center">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-4">Доходы vs. Расходы</h3>
+                            {barChartData[0].Доходы > 0 || barChartData[0].Расходы > 0 ? (
+                                <ResponsiveContainer width="100%" height={300}>
+                                    <BarChart
+                                        data={barChartData}
+                                        margin={{
+                                            top: 20, right: 30, left: 20, bottom: 5,
+                                        }}
+                                    >
+                                        <CartesianGrid strokeDasharray="3 3" />
+                                        <XAxis dataKey="name" />
+                                        <YAxis />
+                                        <Tooltip formatter={(value) => `${value.toLocaleString('ru-RU')} ₽`} />
+                                        <Legend />
+                                        <Bar dataKey="Доходы" fill="#4CAF50" name="Доходы" />
+                                        <Bar dataKey="Расходы" fill="#F44336" name="Расходы" />
+                                    </BarChart>
+                                </ResponsiveContainer>
+                            ) : (
+                                <p className="text-gray-600">Нет данных для построения гистограммы.</p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                {/* All Transactions List (Optional, for debugging/overview) */}
+                <div className="bg-gray-50 p-6 rounded-lg shadow-md mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-4">Все Транзакции за {currentMonthDisplayName}</h2>
+                    {filteredTransactions.length > 0 ? (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-sm">
+                                <thead className="bg-gray-200">
+                                    <tr>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-gray-700 uppercase tracking-wider">Дата</th>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-gray-700 uppercase tracking-wider">Тип</th>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-gray-700 uppercase tracking-wider">Категория</th>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-gray-700 uppercase tracking-wider">Подкатегория</th>
+                                        <th className="py-3 px-4 text-right text-sm font-medium text-gray-700 uppercase tracking-wider">Сумма (₽)</th>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-gray-700 uppercase tracking-wider">Описание</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200">
+                                    {filteredTransactions
+                                        .sort((a, b) => new Date(a.date) - new Date(b.date))
+                                        .map((t) => (
+                                        <tr key={t.id} className={t.type === 'income' ? 'bg-green-50' : 'bg-red-50'}>
+                                            <td className="py-3 px-4 whitespace-nowrap">{t.date}</td>
+                                            <td className="py-3 px-4 whitespace-nowrap">{t.type === 'income' ? 'Доход' : 'Расход'}</td>
+                                            <td className="py-3 px-4 whitespace-nowrap">{t.category}</td>
+                                            <td className="py-3 px-4 whitespace-nowrap">{t.subcategory || '-'}</td>
+                                            <td className="py-3 px-4 text-right whitespace-nowrap">{t.amount.toLocaleString('ru-RU')}</td>
+                                            <td className="py-3 px-4 whitespace-nowrap">{t.description || '-'}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <p className="text-gray-600">Нет транзакций за этот месяц.</p>
+                    )}
+                </div>
+
+                <div className="bg-gray-50 p-6 rounded-lg shadow-md">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-4">Все Пополнения Накоплений</h2>
+                    {savings.length > 0 ? (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-sm">
+                                <thead className="bg-purple-200">
+                                    <tr>
+                                        <th className="py-3 px-4 text-left text-sm font-medium text-purple-800 uppercase tracking-wider">Дата</th>
+                                        <th className="py-3 px-4 text-right text-sm font-medium text-purple-800 uppercase tracking-wider">Сумма (₽)</th>
+                                        <th className="py-3 px-4 text-right text-sm font-medium text-purple-800 uppercase tracking-wider">Годовой %</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200">
+                                    {savings
+                                        .sort((a, b) => new Date(a.date) - new Date(b.date))
+                                        .map((s) => (
+                                        <tr key={s.id}>
+                                            <td className="py-3 px-4 whitespace-nowrap">{s.date}</td>
+                                            <td className="py-3 px-4 text-right whitespace-nowrap">{s.amount.toLocaleString('ru-RU')}</td>
+                                            <td className="py-3 px-4 text-right whitespace-nowrap">{(s.interestRate * 100).toFixed(2)}%</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <p className="text-gray-600">Нет данных о пополнениях накоплений.</p>
+                    )}
+                </div>
+
+            </div>
+        </div>
+    );
+};
+
+export default App;
